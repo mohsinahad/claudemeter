@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -23,6 +23,11 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
 TELEMETRY_DIR = CLAUDE_DIR / "telemetry"
 BUDGET_CONFIG_PATH = CLAUDE_DIR / "dashboard_config.json"
+
+HUMAN_HOURLY_RATE_DEFAULT = 100.0
+HUMAN_LOC_PER_HOUR_DEFAULT = 50
+HOURS_PER_DAY = 8
+DAYS_PER_WEEK = 5
 
 # Cost per million tokens (approximate)
 COST_PER_M: dict[str, dict[str, float]] = {
@@ -53,9 +58,9 @@ CLR_TODAY = "#fbbf24"          # highlight today
 CLR_PRO = "#a78bfa"           # light violet for Pro plan badge
 
 DEFAULT_BUDGET_CONFIG = {
-    "daily_budget": 5.0,
-    "monthly_budget": 50.0,
     "plan": "auto",  # "pro" = Claude Pro (all tokens free), "api" = API billing, "auto" = detect from telemetry
+    "hourly_rate": HUMAN_HOURLY_RATE_DEFAULT,
+    "loc_per_hour": HUMAN_LOC_PER_HOUR_DEFAULT,
 }
 
 TIME_RANGES: dict[str, timedelta | None] = {
@@ -182,6 +187,43 @@ def parse_telemetry_interfaces() -> dict[str, dict[str, int | float]]:
         except (json.JSONDecodeError, OSError):
             continue
     return session_interface  # type: ignore
+
+
+def parse_loc_by_project() -> dict[str, int]:
+    """Count lines of code written per project from Edit/Write tool calls."""
+    project_loc: dict[str, int] = {}
+    if not PROJECTS_DIR.exists():
+        return project_loc
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        proj = _project_name(str(project_dir))
+        loc = 0
+        for jsonl in project_dir.glob("*.jsonl"):
+            for line_data in _read_jsonl(jsonl):
+                msg = line_data.get("message", {})
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                content = msg.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    name = block.get("name", "")
+                    inp = block.get("input", {})
+                    if name == "Write":
+                        file_content = inp.get("content", "")
+                        loc += file_content.count("\n") + (1 if file_content else 0)
+                    elif name == "Edit":
+                        new = inp.get("new_string", "")
+                        old = inp.get("old_string", "")
+                        new_lines = new.count("\n") + (1 if new else 0)
+                        old_lines = old.count("\n") + (1 if old else 0)
+                        loc += max(new_lines - old_lines, 0)
+        if loc > 0:
+            project_loc[proj] = loc
+    return project_loc
 
 
 def load_config() -> dict:
@@ -336,6 +378,7 @@ def gather_data(since: datetime | None = None) -> DashboardData:
     all_sessions = parse_session_files()
     telemetry_costs = parse_telemetry()
     session_interfaces = parse_telemetry_interfaces()
+    loc_by_project = parse_loc_by_project()
 
     for sid, s in all_sessions.items():
         if sid in telemetry_costs:
@@ -377,13 +420,17 @@ def gather_data(since: datetime | None = None) -> DashboardData:
         # Project aggregation
         proj = s.project
         if proj not in data.project_totals:
-            data.project_totals[proj] = {"sessions": 0, "tokens": 0, "cost": 0.0, "messages": 0}
+            data.project_totals[proj] = {"sessions": 0, "tokens": 0, "cost": 0.0, "messages": 0, "loc": 0}
         data.project_totals[proj]["sessions"] += 1
         data.project_totals[proj]["tokens"] += s.input_tokens + s.output_tokens + s.cached_tokens
         data.project_totals[proj]["cost"] += s.cost_usd
         data.project_totals[proj]["messages"] += s.message_count
 
         data.total_cost += s.cost_usd
+
+    for proj, loc in loc_by_project.items():
+        if proj in data.project_totals:
+            data.project_totals[proj]["loc"] = loc
 
     return data
 
@@ -481,52 +528,24 @@ def _detect_live_sessions(data: DashboardData) -> list[str]:
 
 
 def render_budget(data: DashboardData, config: dict) -> Panel:
-    daily_limit = config.get("daily_budget", 5.0)
-    monthly_limit = config.get("monthly_budget", 50.0)
     today_cost = _today_cost(data)
     month_cost = _month_cost(data)
     is_pro = config.get("plan") == "pro"
-
-    def budget_bar(spent: float, limit: float, label: str) -> Text:
-        pct = min(spent / limit, 1.0) if limit > 0 else 0.0
-        bar_width = 20
-        filled = int(pct * bar_width)
-        empty = bar_width - filled
-
-        if is_pro:
-            color = CLR_PRO
-        elif pct > 0.9:
-            color = CLR_COST_HIGH
-        elif pct > 0.6:
-            color = CLR_COST_MED
-        else:
-            color = CLR_COST_LOW
-
-        t = Text()
-        t.append(f"  {label} ", style=CLR_DIM)
-        t.append("\u25b0" * filled, style=f"bold {color}")
-        t.append("\u25b1" * empty, style=CLR_DIM)
-        suffix = " equiv" if is_pro else ""
-        t.append(f" ${spent:.2f}/${limit:.0f}{suffix}", style=f"bold {color}")
-        t.append(f" ({pct * 100:.0f}%)", style=CLR_DIM)
-        return t
 
     text = Text()
     if is_pro:
         text.append("  PRO ", style=f"bold on {CLR_ACCENT}")
         text.append(" ", style=CLR_DIM)
-    daily_bar = budget_bar(today_cost, daily_limit, "Daily ")
-    monthly_bar = budget_bar(month_cost, monthly_limit, "Month ")
-    text.append_text(daily_bar)
-    text.append("    ")
-    text.append_text(monthly_bar)
 
-    if is_pro:
-        border = CLR_ACCENT
-    elif daily_limit and today_cost / daily_limit > 0.9:
-        border = CLR_COST_HIGH
-    else:
-        border = CLR_BORDER
+    suffix = " equiv" if is_pro else ""
+    color = CLR_PRO if is_pro else CLR_ACCENT
+
+    text.append("  Today ", style=CLR_DIM)
+    text.append(f"${today_cost:.2f}{suffix}", style=f"bold {color}")
+    text.append("    Month ", style=CLR_DIM)
+    text.append(f"${month_cost:.2f}{suffix}", style=f"bold {color}")
+
+    border = CLR_ACCENT if is_pro else CLR_BORDER
     return Panel(
         text,
         border_style=Style(color=border),
@@ -1050,6 +1069,111 @@ def render_projects(data: DashboardData, config: dict) -> Panel:
     )
 
 
+def _fmt_duration(hours: float) -> str:
+    """Format hours into a human-readable duration (e.g. 2w 3d 4h)."""
+    if hours < 1:
+        return f"{hours * 60:.0f}m"
+    weeks = int(hours // (HOURS_PER_DAY * DAYS_PER_WEEK))
+    remaining = hours - weeks * HOURS_PER_DAY * DAYS_PER_WEEK
+    days = int(remaining // HOURS_PER_DAY)
+    remaining -= days * HOURS_PER_DAY
+    h = int(remaining)
+    parts: list[str] = []
+    if weeks:
+        parts.append(f"{weeks}w")
+    if days:
+        parts.append(f"{days}d")
+    if h or not parts:
+        parts.append(f"{h}h")
+    return " ".join(parts)
+
+
+def render_cost_estimate(data: DashboardData, config: dict) -> Panel:
+    if not data.project_totals:
+        return Panel(
+            Text("  No project data", style=CLR_DIM),
+            title=f"[bold {CLR_ACCENT}] HUMAN COST ESTIMATE [/bold {CLR_ACCENT}]",
+            border_style=Style(color=CLR_BORDER),
+        )
+
+    is_pro = config.get("plan") == "pro"
+    hourly_rate = config.get("hourly_rate", HUMAN_HOURLY_RATE_DEFAULT)
+    loc_per_hour = config.get("loc_per_hour", HUMAN_LOC_PER_HOUR_DEFAULT)
+
+    table = Table(
+        expand=True,
+        show_header=True,
+        header_style=f"bold {CLR_ACCENT}",
+        padding=(0, 1),
+        border_style=Style(color=CLR_BORDER),
+        show_lines=False,
+    )
+    table.add_column("Project", style=CLR_TEXT)
+    table.add_column("LOC", justify="right", style=CLR_INPUT)
+    table.add_column("Time", justify="right", style=CLR_DIM)
+    table.add_column("Human Cost", justify="right")
+    table.add_column("Claude Cost", justify="right")
+    table.add_column("Savings", justify="right")
+
+    sorted_projects = sorted(
+        data.project_totals.items(),
+        key=lambda x: int(x[1].get("loc", 0)),
+        reverse=True,
+    )
+
+    total_loc = 0
+    total_human = 0.0
+    total_claude = 0.0
+
+    for proj, stats in sorted_projects[:10]:
+        loc = int(stats.get("loc", 0))
+        if loc == 0:
+            continue
+        claude_cost = float(stats["cost"])
+        human_hours = loc / loc_per_hour
+        human_cost = human_hours * hourly_rate
+        savings = human_cost - claude_cost
+
+        total_loc += loc
+        total_human += human_cost
+        total_claude += claude_cost
+
+        savings_color = CLR_COST_LOW if savings > 0 else CLR_COST_HIGH
+        suffix = " eq" if is_pro else ""
+        table.add_row(
+            Text(proj[:20], style=CLR_TEXT),
+            f"{loc:,}",
+            _fmt_duration(human_hours),
+            Text(f"${human_cost:,.0f}", style=CLR_COST_MED),
+            Text(f"${claude_cost:.2f}{suffix}", style=CLR_PRO if is_pro else CLR_INPUT),
+            Text(f"${savings:,.0f}", style=savings_color),
+        )
+
+    if total_loc > 0:
+        total_hours = total_loc / loc_per_hour
+        total_savings = total_human - total_claude
+        savings_color = CLR_COST_LOW if total_savings > 0 else CLR_COST_HIGH
+        suffix = " eq" if is_pro else ""
+        table.add_row(
+            Text("TOTAL", style=f"bold {CLR_BOLD}"),
+            Text(f"{total_loc:,}", style=f"bold {CLR_INPUT}"),
+            Text(_fmt_duration(total_hours), style=f"bold {CLR_DIM}"),
+            Text(f"${total_human:,.0f}", style=f"bold {CLR_COST_MED}"),
+            Text(f"${total_claude:.2f}{suffix}", style=f"bold {CLR_PRO if is_pro else CLR_INPUT}"),
+            Text(f"${total_savings:,.0f}", style=f"bold {savings_color}"),
+        )
+
+    rate_note = f"  @ ${hourly_rate:.0f}/hr, {loc_per_hour} LOC/hr, {HOURS_PER_DAY}h/day, {DAYS_PER_WEEK}d/week"
+    footer = Text(rate_note, style=CLR_DIM)
+
+    return Panel(
+        Group(table, footer),
+        title=f"[bold {CLR_ACCENT}] HUMAN COST ESTIMATE [/bold {CLR_ACCENT}]",
+        border_style=Style(color=CLR_BORDER),
+        padding=(0, 0),
+    )
+
+
 def build_layout(data: DashboardData, state: DashboardState, config: dict) -> Layout:
     layout = Layout()
     layout.split_column(
@@ -1102,7 +1226,8 @@ def build_layout(data: DashboardData, state: DashboardState, config: dict) -> La
         layout["body"].split_column(
             Layout(name="top", ratio=2),
             Layout(name="middle", ratio=2),
-            Layout(name="bottom", ratio=3),
+            Layout(name="bottom", ratio=2),
+            Layout(name="cost_estimate", ratio=2),
         )
         layout["top"].split_row(
             Layout(name="summary"),
@@ -1123,6 +1248,7 @@ def build_layout(data: DashboardData, state: DashboardState, config: dict) -> La
         layout["heatmap"].update(render_heatmap(data))
         layout["sessions"].update(render_sessions(data, state, config))
         layout["models"].update(render_models(data))
+        layout["cost_estimate"].update(render_cost_estimate(data, config))
 
     return layout
 
