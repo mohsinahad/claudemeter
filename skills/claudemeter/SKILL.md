@@ -31,15 +31,15 @@ If `$ARGUMENTS` is empty (default), launch the live dashboard (steps below).
    which claudemeter 2>/dev/null
    ```
 
-2. If not installed, install it:
+2. If not installed, install it. Try PyPI first, fall back to GitHub:
    ```bash
    if command -v pipx &>/dev/null; then
-     pipx install claudemeter
+     pipx install claudemeter 2>/dev/null || pipx install git+https://github.com/mohsinahad/claudemeter.git
    else
-     pip install --user claudemeter
+     pip install --user claudemeter 2>/dev/null || pip install --user git+https://github.com/mohsinahad/claudemeter.git
    fi
    ```
-   If installation fails, tell the user to run the above manually.
+   If installation fails, tell the user to run one of the above manually.
 
 3. Launch the dashboard in a new tab. Since claudemeter is a live TUI it must run in a real terminal, not inside Claude's tool executor.
 

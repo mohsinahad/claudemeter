@@ -1343,7 +1343,11 @@ def main() -> None:
             print("Reads data from ~/.claude/ — no API key required.")
             return
         if arg in ("-v", "--version"):
-            print("claudemeter 0.1.0")
+            try:
+                from importlib.metadata import version
+                print(f"claudemeter {version('claudemeter')}")
+            except Exception:
+                print("claudemeter 0.1.0")
             return
         if arg == "summary":
             _cmd_summary()
