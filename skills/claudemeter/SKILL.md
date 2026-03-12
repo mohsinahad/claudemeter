@@ -10,24 +10,48 @@ Launch the ClaudeMeter live terminal dashboard.
 
 1. Check if `claudemeter` is installed:
    ```bash
-   which claudemeter 2>/dev/null || pip show claudemeter 2>/dev/null
+   which claudemeter 2>/dev/null
    ```
 
-2. If not installed, install it from the GitHub repo:
+2. If not installed, try to install it. Prefer `pipx` (isolated, always on PATH) over `pip`:
    ```bash
-   pip install git+https://github.com/mohsinahad/claudemeter.git
+   if command -v pipx &>/dev/null; then
+     pipx install git+https://github.com/mohsinahad/claudemeter.git
+   else
+     pip install --user git+https://github.com/mohsinahad/claudemeter.git
+   fi
    ```
-   (If that fails, tell the user to install manually with the above command.)
+   If installation fails, tell the user to run one of the above commands manually in their terminal and then run `claudemeter` themselves.
 
-3. Launch the dashboard in a new Terminal window so it doesn't interrupt the Claude session:
+3. Launch the dashboard. Since claudemeter is a live TUI it must run in a real terminal, not inside Claude's tool executor. Use the best available method:
+
+   **macOS** — open a new window in whichever terminal app is running:
    ```bash
-   osascript -e 'tell application "Terminal" to do script "claudemeter"'
+   if command -v osascript &>/dev/null; then
+     # Try iTerm2 first, fall back to Terminal.app
+     osascript <<'SCRIPT'
+       tell application "System Events"
+         set frontApp to name of first application process whose frontmost is true
+       end tell
+       if frontApp is "iTerm2" then
+         tell application "iTerm2"
+           create window with default profile command "claudemeter"
+         end tell
+       else
+         tell application "Terminal" to do script "claudemeter"
+       end if
+   SCRIPT
+   fi
    ```
-   On Linux (no osascript), run directly:
+
+   **Linux** — print instructions instead of blocking:
    ```bash
-   claudemeter
+   echo "Run 'claudemeter' in your terminal to launch the dashboard."
    ```
 
-4. Confirm to the user that the dashboard has launched (or is running in their terminal).
+4. Tell the user the dashboard is launching (or give them the command to run manually if the auto-launch didn't work).
 
-Note: The dashboard reads from `~/.claude/` — no API key or config required beyond normal Claude Code usage.
+## Notes
+- No API key or config required — reads directly from `~/.claude/`
+- Press `q` or `Ctrl+C` to exit the dashboard
+- If the install step puts `claudemeter` in `~/.local/bin` and it's not on PATH, tell the user to add `export PATH="$HOME/.local/bin:$PATH"` to their shell profile
